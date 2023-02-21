@@ -1,6 +1,47 @@
 ## Introduction
 
-This repository provides `pre-built headless OpenCV` for AWS Lambda. Python OpenCV includes native code libraries, I compiled and build these libraries using a Linux development machine so that the binaries are compatible with Amazon Linux. Once this layer is applied, you can use the layer to host your own algorithms on lambda for Python OpenCV. Also, This layer file contains version `Numpy==1.21.5`. These libraries were created in `Python 3.7.10`.
+This repository provides `pre-built headless OpenCV` for AWS Lambda. Python OpenCV includes native code libraries, I compiled and build these libraries using a Linux development machine so that the binaries are compatible with Amazon Linux. Once this layer is applied, you can use the layer to host your own algorithms on lambda for Python OpenCV.
+
+
+## Python Version
+
+For each Python directory, it was created as follows:
+
+### Support Pre-built Python 3.7.10 
+
+> `based on Numpy==1.21.5`
+
+- opencv-python-headless-3.4.17.61
+- opencv-python-headless-4.0.1.24
+- opencv-python-headless-4.1.2.30
+- opencv-python-headless-4.2.0.34
+- opencv-python-headless-4.3.0.38
+- opencv-python-headless-4.4.0.46
+- opencv-python-headless-4.5.5.62
+
+### Support Pre-built Python 3.8.16
+
+> `based on Numpy==1.24.2`
+
+- opencv-python-headless-3.4.18.65
+- opencv-python-headless-4.1.2.30
+- opencv-python-headless-4.2.0.34
+- opencv-python-headless-4.3.0.38
+- opencv-python-headless-4.4.0.46
+- opencv-python-headless-4.5.5.64
+- opencv-python-headless-4.6.0.66
+- opencv-python-headless-4.7.0.68
+
+### Support Pre-built Python 3.9.16 
+
+> `based on Numpy==1.24.2`
+
+- opencv-python-headless-3.4.18.65
+- opencv-python-headless-4.4.0.46
+- opencv-python-headless-4.5.5.64
+- opencv-python-headless-4.6.0.66
+- opencv-python-headless-4.7.0.68
+
 
 ## Apply Layer
 
@@ -18,15 +59,6 @@ This repository provides `pre-built headless OpenCV` for AWS Lambda. Python Open
 
 7. Choose Create.
 
-## Support Pre-built Version
-
-- opencv-python-headless-3.4.17.61
-- opencv-python-headless-4.0.1.24
-- opencv-python-headless-4.1.2.30
-- opencv-python-headless-4.2.0.34
-- opencv-python-headless-4.3.0.38
-- opencv-python-headless-4.4.0.46
-- opencv-python-headless-4.5.5.62
 
 ## Structure
 
