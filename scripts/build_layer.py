@@ -125,7 +125,7 @@ profile = sys.argv[1]
 if profile in ("standard", "dnn"):
     cv2.ORB_create().detectAndCompute(gray, None)
     cv2.findHomography
-    cv2.CascadeClassifier
+    cv2.QRCodeDetector().detect(gray)
 if profile == "dnn":
     cv2.dnn.blobFromImage(img)
 assert np.linalg.inv(np.eye(3)).trace() == 3
@@ -314,8 +314,11 @@ def package_one(cv_tar: Path, np_tar: Path, out: Path) -> dict:
     env = {**os.environ, "PYTHONPATH": str(site), "PYTHONDONTWRITEBYTECODE": "1"}
     result = subprocess.run(
         [sys.executable, "-c", SMOKE_TEST, profile],
-        env=env, check=True, capture_output=True, text=True,
+        env=env, capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        print(f"smoke test failed: {cv_tar.name}\n{result.stderr}", file=sys.stderr, flush=True)
+        raise RuntimeError(f"smoke test failed: {cv_tar.name}")
     versions = json.loads(result.stdout)
 
     zip_path = out / f"opencv-{cv_ver}-{profile}-python{py_version()}-{arch()}.zip"
@@ -339,8 +342,14 @@ def package(artifacts: Path, out: Path) -> None:
     cv_tars = sorted(artifacts.glob(f"opencv-*-{arch()}.tar.gz"))
     if len(np_tars) != 1 or not cv_tars:
         sys.exit(f"need exactly one numpy and at least one opencv tarball, got {np_tars} {cv_tars}")
+    failed = []
     for cv_tar in cv_tars:
-        package_one(cv_tar, np_tars[0], out)
+        try:
+            package_one(cv_tar, np_tars[0], out)
+        except RuntimeError:
+            failed.append(cv_tar.name)
+    if failed:
+        sys.exit(f"failed: {', '.join(failed)}")
 
 
 # ----------------------------------------------------------------------- main
