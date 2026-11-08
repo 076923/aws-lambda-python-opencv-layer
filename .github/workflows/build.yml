@@ -6,9 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   NUMPY_VERSION: "2.5.4"
 
+# Actions are pinned to commit SHAs; Dependabot keeps them up to date.
 jobs:
   # cv2 is built with the Python Limited API, so one build per
   # (OpenCV, profile, arch) serves every Python >= 3.12.
@@ -21,12 +25,12 @@ jobs:
         arch: [x86_64, arm64]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: ./build.sh 3.12 ${{ matrix.arch }} opencv ${{ matrix.opencv }} ${{ matrix.profile }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: opencv-${{ matrix.opencv }}-${{ matrix.profile }}-${{ matrix.arch }}
-          path: artifacts/*.tar.gz
+          path: artifacts/*
           if-no-files-found: error
 
   numpy:
@@ -37,15 +41,16 @@ jobs:
         arch: [x86_64, arm64]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: ./build.sh ${{ matrix.python }} ${{ matrix.arch }} numpy ${{ env.NUMPY_VERSION }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: numpy-${{ matrix.python }}-${{ matrix.arch }}
-          path: artifacts/*.tar.gz
+          path: artifacts/*
           if-no-files-found: error
 
-  # Smoke-test and zip inside each target runtime.
+  # Smoke-test and zip inside each target runtime, then invoke every zip
+  # through the Lambda Runtime Interface Emulator with /opt mounted read-only.
   package:
     needs: [opencv, numpy]
     strategy:
@@ -55,18 +60,19 @@ jobs:
         arch: [x86_64, arm64]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: opencv-*-${{ matrix.arch }}
           path: artifacts
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: numpy-${{ matrix.python }}-${{ matrix.arch }}
           path: artifacts
       - run: ./build.sh ${{ matrix.python }} ${{ matrix.arch }} package
-      - uses: actions/upload-artifact@v4
+      - run: python3 scripts/test_layer.py dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: layers-${{ matrix.python }}-${{ matrix.arch }}
           path: dist/*
@@ -90,8 +96,10 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: layers-*
           path: dist
@@ -101,13 +109,25 @@ jobs:
         run: |
           sha256sum *.zip > SHA256SUMS
           {
-            echo "| File | Profile | Python | Arch | OpenCV | NumPy | Unzipped (MB) | Zipped (MB) |"
-            echo "|---|---|---|---|---|---|---|---|"
-            jq -rs 'sort_by(.file)[] | "| \(.file) | \(.profile) | \(.python) | \(.arch) | \(.opencv) | \(.numpy) | \(.unzipped_mb) | \(.zipped_mb) |"' *.json
+            echo "| File | Profile | Python | Arch | OpenCV | NumPy | Zipped (MB) | Unzipped (MB) | Import (ms) |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            ls *.json | grep -v '\.cdx\.json$' | xargs jq -rs 'sort_by(.file)[] | "| \(.file) | \(.profile) | \(.python) | \(.arch) | \(.opencv) | \(.numpy) | \(.zipped_mb) | \(.unzipped_mb) | \(.lambda_test.import_ms) |"'
+            echo
+            echo "Import time was measured in the Lambda Runtime Interface Emulator on GitHub-hosted runners, not on AWS Lambda."
+            echo
+            echo "Each zip has a CycloneDX SBOM (\`.cdx.json\`) and a build provenance attestation:"
+            echo
+            echo '```bash'
+            echo "gh attestation verify <file>.zip -R ${GITHUB_REPOSITORY}"
+            echo '```'
           } > ../notes.md
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.zip
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: |
             dist/*.zip
+            dist/*.cdx.json
             dist/SHA256SUMS
           body_path: notes.md

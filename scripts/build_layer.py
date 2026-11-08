@@ -11,24 +11,50 @@ Stages (each writes into --artifacts):
            -> numpy-<ver>-python<py>-<arch>.tar.gz
   package  Combine every opencv tarball of this arch with this Python's numpy,
            prune, precompile, smoke-test, and zip.
-           -> dist/opencv-<ver>-<profile>-python<py>-<arch>.zip (+ .json)
+           -> dist/opencv-<ver>-<profile>-python<py>-<arch>.zip
+              (+ .json build info, + .cdx.json CycloneDX SBOM)
+
+Each build stage also writes a <tarball>.build.json sidecar with the verified
+source hash, build tool versions, and bundled third-party libraries.
 """
 
 import argparse
 import compileall
+import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import sysconfig
 import tarfile
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
 DEFAULT_NUMPY = "2.5.4"
+
+# Build tools installed with pip inside the build container. The compiler
+# comes from the Amazon Linux 2023 repositories of the pinned base image.
+BUILD_TOOLS = {
+    "cmake": "4.4.4",
+    "ninja": "1.13.2",
+    "meson": "1.12.1",
+    "meson-python": "0.22.1",
+    "cython": "3.3.1",
+}
+
+# SHA256 of the source archives. Add an entry when bumping a version.
+OPENCV_SOURCES = {
+    "4.14.0": "ee8fb9b30eb60850431b4656447080e3737b56e45719c92b67f245950609f86e",
+    "5.1.0": "638c1dae7e37e45afea21aa217dc667ad7cf57acc66cdf652c074f1e0e5ad6d2",
+}
+NUMPY_SOURCES = {
+    "2.5.4": "9a94cf751c9ad8ebaa835bcd3d40dacf8534ad086b88c38029b65123c7999d2a",
+}
 
 # OpenCV 5 renamed several modules. Names that do not exist in the source
 # tree are dropped before configuring, so one list covers 4.x and 5.x.
@@ -152,8 +178,64 @@ def pip(*args) -> None:
 
 
 def install_toolchain() -> None:
-    run("dnf", "install", "-y", "gcc", "gcc-c++", "binutils")
-    pip("install", "cmake", "ninja")
+    # libjpeg-turbo needs NASM for its x86_64 SIMD code; without it JPEG
+    # encode/decode silently falls back to plain C. arm64 uses NEON intrinsics.
+    extra = ["nasm"] if arch() == "x86_64" else []
+    run("dnf", "install", "-y", "gcc", "gcc-c++", "binutils", *extra)
+    pip("install", *[f"{k}=={v}" for k, v in BUILD_TOOLS.items()])
+
+
+def output(*cmd) -> str:
+    return subprocess.run([str(c) for c in cmd], check=True, capture_output=True, text=True).stdout
+
+
+def toolchain_info() -> dict:
+    return {
+        # Set by build.sh from `docker image inspect`, e.g. ...python@sha256:...
+        "image": os.environ.get("LAMBDA_IMAGE", "unknown"),
+        "gcc": output("gcc", "-dumpfullversion").strip(),
+        "python": platform.python_version(),
+        **BUILD_TOOLS,
+    }
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_verified(url: str, dest: Path, expected: str) -> None:
+    if not dest.exists():
+        print("+ download", url, flush=True)
+        urllib.request.urlretrieve(url, dest)
+    actual = sha256(dest)
+    if actual != expected:
+        dest.unlink()
+        sys.exit(f"SHA256 mismatch for {url}\n  expected {expected}\n  actual   {actual}")
+    print(f"+ verified sha256 {actual}", flush=True)
+
+
+def sidecar(tarball: Path) -> Path:
+    return tarball.with_name(tarball.name.removesuffix(".tar.gz") + ".build.json")
+
+
+# Third-party libraries OpenCV builds from its bundled sources, as reported in
+# the "Media I/O" and "Other third-party libraries" sections of cmake output.
+THIRD_PARTY = re.compile(
+    r"^(?:--)?\s+(ZLib|JPEG|WEBP|PNG|Protobuf|Flatbuffers|KleidiCV|QUIRC)\s*:\s+(.+?)\s*$", re.M
+)
+
+
+def third_party(cmake_output: str) -> dict:
+    found = {}
+    for name, value in THIRD_PARTY.findall(cmake_output):
+        if value.upper() in ("NO", "OFF"):
+            continue
+        found[name] = value
+    return found
 
 
 def strip_binaries(root: Path) -> None:
@@ -186,6 +268,8 @@ def unpack(src: Path, dest: Path) -> None:
 
 
 def build_opencv(version: str, profile: str, out: Path) -> Path:
+    if version not in OPENCV_SOURCES:
+        sys.exit(f"no SHA256 for OpenCV {version}; add it to OPENCV_SOURCES")
     install_toolchain()
     # numpy headers for the bindings; numpy >= 2 headers stay ABI-compatible.
     pip("install", f"numpy=={DEFAULT_NUMPY}")
@@ -193,10 +277,8 @@ def build_opencv(version: str, profile: str, out: Path) -> Path:
     src_root = Path("/tmp/opencv-src")
     shutil.rmtree(src_root, ignore_errors=True)
     tarball = Path(f"/tmp/opencv-{version}.tar.gz")
-    if not tarball.exists():
-        url = f"https://github.com/opencv/opencv/archive/refs/tags/{version}.tar.gz"
-        print("+ download", url, flush=True)
-        urllib.request.urlretrieve(url, tarball)
+    url = f"https://github.com/opencv/opencv/archive/refs/tags/{version}.tar.gz"
+    download_verified(url, tarball, OPENCV_SOURCES[version])
     unpack(tarball, src_root)
     src = src_root / f"opencv-{version}"
 
@@ -220,8 +302,14 @@ def build_opencv(version: str, profile: str, out: Path) -> Path:
         "PYTHON3_INCLUDE_DIR": sysconfig.get_paths()["include"],
         "PYTHON3_NUMPY_INCLUDE_DIRS": numpy.get_include(),
     }
-    run("cmake", "-S", src, "-B", build, "-G", "Ninja",
-        *[f"-D{k}={v}" for k, v in defs.items()])
+    configure = [str(c) for c in ("cmake", "-S", src, "-B", build, "-G", "Ninja",
+                                  *[f"-D{k}={v}" for k, v in defs.items()])]
+    print("+", " ".join(configure), flush=True)
+    result = subprocess.run(configure, check=True, capture_output=True, text=True)
+    print(result.stdout, result.stderr, sep="\n", flush=True)
+    jpeg_simd = re.search(r"JPEG:.*\n.*SIMD Support Request:.*\n--\s+SIMD Support:\s+(\S+)", result.stdout)
+    if not jpeg_simd or jpeg_simd.group(1) != "YES":
+        sys.exit("libjpeg-turbo SIMD is disabled; check the cmake output above")
     run("cmake", "--build", build)
     run("cmake", "--install", build, "--strip")
 
@@ -237,6 +325,12 @@ def build_opencv(version: str, profile: str, out: Path) -> Path:
 
     dest = out / f"opencv-{version}-{profile}-{arch()}.tar.gz"
     pack(stage, dest)
+    sidecar(dest).write_text(json.dumps({
+        "opencv": {"version": version, "url": url, "sha256": OPENCV_SOURCES[version]},
+        "modules": modules,
+        "third_party": third_party(result.stdout),
+        "toolchain": toolchain_info(),
+    }, indent=2) + "\n")
     print(f"{dest.name}: {mb(dir_size(stage))} MB unpacked")
     return dest
 
@@ -245,20 +339,31 @@ def build_opencv(version: str, profile: str, out: Path) -> Path:
 
 
 def build_numpy(version: str, out: Path) -> Path:
+    if version not in NUMPY_SOURCES:
+        sys.exit(f"no SHA256 for numpy {version}; add it to NUMPY_SOURCES")
     install_toolchain()
+    sdist = Path(f"/tmp/numpy-{version}.tar.gz")
+    url = f"https://files.pythonhosted.org/packages/source/n/numpy/numpy-{version}.tar.gz"
+    download_verified(url, sdist, NUMPY_SOURCES[version])
+
     stage = Path("/tmp/numpy-stage")
     shutil.rmtree(stage, ignore_errors=True)
     # No BLAS/LAPACK: numpy falls back to its bundled lapack_lite, which drops
     # the ~27 MB OpenBLAS + gfortran runtime. Large matmul/linalg get slower.
-    pip("install", "--target", stage, "--no-deps", "--no-binary=numpy",
+    # --no-build-isolation builds with the pinned meson/cython from BUILD_TOOLS.
+    pip("install", "--target", stage, "--no-deps", "--no-build-isolation",
         "--config-settings=setup-args=-Dallow-noblas=true",
         "--config-settings=setup-args=-Dblas=none",
         "--config-settings=setup-args=-Dlapack=none",
-        f"numpy=={version}")
+        sdist)
     strip_binaries(stage)
 
     dest = out / f"numpy-{version}-python{py_version()}-{arch()}.tar.gz"
     pack(stage, dest)
+    sidecar(dest).write_text(json.dumps({
+        "numpy": {"version": version, "url": url, "sha256": NUMPY_SOURCES[version], "blas": "none"},
+        "toolchain": toolchain_info(),
+    }, indent=2) + "\n")
     print(f"{dest.name}: {mb(dir_size(stage))} MB unpacked")
     return dest
 
@@ -323,6 +428,8 @@ def package_one(cv_tar: Path, np_tar: Path, out: Path) -> dict:
 
     zip_path = out / f"opencv-{cv_ver}-{profile}-python{py_version()}-{arch()}.zip"
     make_zip(site, zip_path)
+    cv_build = json.loads(sidecar(cv_tar).read_text()) if sidecar(cv_tar).exists() else {}
+    np_build = json.loads(sidecar(np_tar).read_text()) if sidecar(np_tar).exists() else {}
     info = {
         "file": zip_path.name,
         "profile": profile,
@@ -331,10 +438,66 @@ def package_one(cv_tar: Path, np_tar: Path, out: Path) -> dict:
         **versions,
         "unzipped_mb": mb(dir_size(site)),
         "zipped_mb": mb(zip_path.stat().st_size),
+        "sha256": sha256(zip_path),
+        "build": {"opencv": cv_build, "numpy": np_build},
     }
     zip_path.with_suffix(".json").write_text(json.dumps(info, indent=2) + "\n")
-    print(json.dumps(info), flush=True)
+    zip_path.with_suffix(".cdx.json").write_text(json.dumps(make_sbom(info), indent=2) + "\n")
+    print(json.dumps({k: v for k, v in info.items() if k != "build"}), flush=True)
     return info
+
+
+def make_sbom(info: dict) -> dict:
+    """CycloneDX 1.5 SBOM for one layer zip."""
+    cv = info["build"]["opencv"]
+    np_ = info["build"]["numpy"]
+    components = [
+        {
+            "type": "library",
+            "name": "opencv",
+            "version": info["opencv"],
+            "purl": f"pkg:github/opencv/opencv@{info['opencv']}",
+            "licenses": [{"license": {"id": "Apache-2.0"}}],
+            "hashes": [{"alg": "SHA-256", "content": cv.get("opencv", {}).get("sha256", "")}],
+            "externalReferences": [{"type": "distribution", "url": cv.get("opencv", {}).get("url", "")}],
+            "properties": [{"name": "opencv:modules", "value": ",".join(cv.get("modules", []))}],
+        },
+        {
+            "type": "library",
+            "name": "numpy",
+            "version": info["numpy"],
+            "purl": f"pkg:pypi/numpy@{info['numpy']}",
+            "licenses": [{"license": {"id": "BSD-3-Clause"}}],
+            "hashes": [{"alg": "SHA-256", "content": np_.get("numpy", {}).get("sha256", "")}],
+            "externalReferences": [{"type": "distribution", "url": np_.get("numpy", {}).get("url", "")}],
+            "properties": [{"name": "numpy:blas", "value": "none"}],
+        },
+    ]
+    # Bundled by OpenCV and linked statically into cv2.abi3.so.
+    for name, value in cv.get("third_party", {}).items():
+        m = re.search(r"\d+(?:\.\d+)+[^\s,)]*", value)
+        components.append({
+            "type": "library",
+            "name": name.lower(),
+            "version": m.group(0) if m else value,
+            "description": f"Bundled with OpenCV, linked statically: {value}",
+        })
+    toolchain = cv.get("toolchain") or np_.get("toolchain") or {}
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "serialNumber": f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, info['sha256'])}",
+        "version": 1,
+        "metadata": {
+            "component": {
+                "type": "library",
+                "name": info["file"],
+                "hashes": [{"alg": "SHA-256", "content": info["sha256"]}],
+            },
+            "properties": [{"name": f"build:{k}", "value": str(v)} for k, v in toolchain.items()],
+        },
+        "components": components,
+    }
 
 
 def package(artifacts: Path, out: Path) -> None:
@@ -376,6 +539,23 @@ def main() -> None:
     p.add_argument("--numpy", default=DEFAULT_NUMPY)
 
     args = parser.parse_args()
+    try:
+        run_stage(args)
+    finally:
+        give_back(args.artifacts, args.out)
+
+
+def give_back(*dirs: Path) -> None:
+    """The container runs as root; hand outputs back to the host user."""
+    uid, gid = os.environ.get("HOST_UID"), os.environ.get("HOST_GID")
+    if os.geteuid() != 0 or not uid or not gid:
+        return
+    for d in dirs:
+        for p in [d, *d.rglob("*")] if d.exists() else []:
+            os.chown(p, int(uid), int(gid))
+
+
+def run_stage(args: argparse.Namespace) -> None:
     if args.stage == "opencv":
         build_opencv(args.version, args.profile, args.artifacts)
     elif args.stage == "numpy":

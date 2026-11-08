@@ -22,8 +22,15 @@ esac
 cd "$(dirname "$0")"
 mkdir -p artifacts dist
 
+IMAGE="public.ecr.aws/lambda/python:${PY}"
+docker pull -q --platform "$PLATFORM" "$IMAGE" > /dev/null
+# Record the exact image digest in the build info.
+DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+
 docker run --rm --platform "$PLATFORM" \
+  -e LAMBDA_IMAGE="$DIGEST" \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   -v "$PWD:/work" -w /work \
   --entrypoint python3 \
-  "public.ecr.aws/lambda/python:${PY}" \
+  "$IMAGE" \
   scripts/build_layer.py "$@"
