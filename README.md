@@ -15,8 +15,8 @@ Minimal headless OpenCV layers for AWS Lambda, built from source.
 
 - **Small**: OpenCV and its codecs are linked statically into a single stripped `cv2.abi3.so`, without FFmpeg or OpenBLAS.
 - **Fast cold start**: Precompiled bytecode is included, because Lambda cannot write a bytecode cache to `/opt`.
-- **Runtime-matched**: Built and smoke-tested inside the official `public.ecr.aws/lambda/python` images.
-- **Reproducible**: Deterministic zips with `SHA256SUMS`, built by GitHub Actions.
+- **Runtime-matched**: Built inside the official `public.ecr.aws/lambda/python` images, and every zip is invoked through the Lambda Runtime Interface Emulator before release.
+- **Verifiable**: Pinned sources and build tools, deterministic zips, `SHA256SUMS`, a CycloneDX SBOM per zip, and GitHub build provenance attestations.
 
 
 ## Quick Start
@@ -105,6 +105,12 @@ The layers keep only what image processing on Lambda needs.
 | Haar cascade XML files | Ship the XML files you need with your function. `cv2.CascadeClassifier` is only available with 4.14.0, because OpenCV 5 removed it from the main repository |
 | `python3.11` and older | These runtimes run on Amazon Linux 2 and are not supported |
 
+> [!WARNING]
+> **NumPy is built without BLAS.** This is fine for image processing, where NumPy mostly holds pixel arrays for OpenCV. If your function uses NumPy as a compute engine (large matrix products, decompositions, solvers), these layers are the wrong choice. Use the official `opencv-python-headless` and `numpy` wheels, which bundle OpenBLAS.
+
+> [!WARNING]
+> **x86_64 binaries require AVX2.** `cv2` is compiled with `CPU_BASELINE=AVX2` and has no fallback path. Every AWS Lambda x86_64 host supports AVX2, but other machines may not, such as older CPUs or some emulators. On a CPU without AVX2, `import cv2` stops with an error that the build does not support the current CPU. The `arm64` builds use the default NEON baseline.
+
 
 ## How It Stays Small
 
@@ -118,6 +124,48 @@ The layers keep only what image processing on Lambda needs.
 | `.pyc` compiled with `unchecked-hash` | Zip rounds file times to 2 seconds, so timestamp-checked bytecode would be ignored on every cold start |
 
 
+## Testing
+
+Every zip goes through two checks before it can be merged or released. CI fails if either one fails.
+
+| Check | Where | What it verifies |
+|---|---|---|
+| Smoke test | Build container, before zipping | `cv2` and `numpy` import, and basic image operations work |
+| Lambda invocation | Fresh `public.ecr.aws/lambda/python` container with the zip extracted to a read-only `/opt`, invoked through the Runtime Interface Emulator with 1024 MB of memory | See below |
+
+The Lambda invocation runs [`tests/lambda/handler.py`](tests/lambda/handler.py) twice, once cold and once warm, and checks:
+
+- `cv2` and `numpy` load from `/opt/python`, and the precompiled bytecode is present
+- JPEG, PNG, and WebP round trips
+- ORB matching recovers a known shift through `findHomography` (`standard`, `dnn`)
+- `cv2.dnn.blobFromImage` (`dnn`)
+- Each profile has its modules and lacks the ones it excludes, such as `cv2.dnn` in `standard` and `cv2.VideoCapture` everywhere
+- Import time, a 12 MP decode → resize → blur → WebP pipeline, and peak memory, which are recorded in each zip's `.json`
+
+> [!NOTE]
+> The emulator runs on GitHub-hosted runners, so the timings are indicative only. Cold start, memory, and latency on AWS Lambda itself are not measured.
+
+To run the Lambda invocation locally after a build, run `python3 scripts/test_layer.py dist`.
+
+
+## Supply Chain
+
+| Item | How |
+|---|---|
+| Source archives | The OpenCV and NumPy source archives are verified against SHA256 hashes pinned in [`scripts/build_layer.py`](scripts/build_layer.py) before building |
+| Build tools | CMake, Ninja, Meson, meson-python, and Cython versions are pinned. NumPy builds without build isolation, so only the pinned tools are used |
+| Build environment | The Lambda image digest, GCC version, and tool versions are recorded in each zip's `.json` |
+| GitHub Actions | Actions are pinned to commit SHAs and updated by Dependabot |
+| SBOM | Each release includes a CycloneDX SBOM (`.cdx.json`) per zip, listing OpenCV, NumPy, and the third-party libraries linked into `cv2` |
+| Provenance | Each zip has a GitHub build provenance attestation |
+
+`SHA256SUMS` proves that a download is intact. The attestation also proves that the zip was built by this repository's workflow:
+
+```bash
+gh attestation verify opencv-4.14.0-minimal-python3.13-arm64.zip -R 076923/aws-lambda-python-opencv-layer
+```
+
+
 ## Build from Source
 
 Requires Docker. Building `arm64` on an `x86_64` machine uses QEMU emulation and is slow.
@@ -129,7 +177,12 @@ Requires Docker. Building `arm64` on an `x86_64` machine uses QEMU emulation and
 
 ```
 dist/opencv-4.14.0-minimal-python3.13-arm64.zip
-dist/opencv-4.14.0-minimal-python3.13-arm64.json   # versions and sizes
+dist/opencv-4.14.0-minimal-python3.13-arm64.json       # versions, sizes, build info, test results
+dist/opencv-4.14.0-minimal-python3.13-arm64.cdx.json   # CycloneDX SBOM
+```
+
+```bash
+python3 scripts/test_layer.py dist   # invoke every zip through the Lambda emulator
 ```
 
 <details>
@@ -172,7 +225,9 @@ opencv-{opencv}-{profile}-python{python}-{arch}.zip
 
 ## Release
 
-Push a `v*` tag. GitHub Actions builds all 36 zips and attaches them to the release with `SHA256SUMS` and a size table.
+Push a `v*` tag. GitHub Actions builds and tests all 36 zips, then attaches them to the release with their SBOMs, `SHA256SUMS`, provenance attestations, and a size table.
+
+To change the OpenCV or NumPy version, update the workflow matrix and add the SHA256 of the new source archive to `OPENCV_SOURCES` or `NUMPY_SOURCES` in [`scripts/build_layer.py`](scripts/build_layer.py).
 
 ```bash
 git tag v2026.11.0
