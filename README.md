@@ -38,7 +38,7 @@ aws lambda publish-layer-version \
 ```
 
 > [!NOTE]
-> Zips larger than 50 MB must be uploaded to S3 first and passed with `--content S3Bucket=<bucket>,S3Key=<key>`.
+> Every zip is under the 50 MB limit for direct upload. If your own build is larger, upload it to S3 first and pass `--content S3Bucket=<bucket>,S3Key=<key>`.
 
 **3. Use** it in your function.
 
@@ -75,7 +75,15 @@ Asset name: `opencv-{opencv}-{profile}-python{python}-{arch}.zip`
 | `standard` | minimal + features2d, calib3d, flann, objdetect, photo, video, ml | Feature matching, homography, QR codes, inpainting, optical flow |
 | `dnn` | standard + dnn | Running ONNX and other models with `cv2.dnn` |
 
-Each release lists the exact NumPy version and the zipped and unzipped size of every asset.
+Sizes for Python 3.13 with NumPy 2.5.4 (zipped / unzipped, MB). Other Python versions differ by less than 0.3 MB.
+
+| Profile | 4.14.0 x86_64 | 4.14.0 arm64 | 5.1.0 x86_64 | 5.1.0 arm64 |
+|---|---|---|---|---|
+| `minimal` | 12.4 / 33.6 | 10.5 / 29.2 | 14.6 / 39.3 | 13.0 / 35.1 |
+| `standard` | 15.7 / 41.7 | 13.4 / 36.0 | 17.0 / 44.9 | 15.0 / 39.8 |
+| `dnn` | 18.3 / 48.6 | 15.7 / 42.0 | 20.9 / 57.0 | 18.4 / 50.1 |
+
+For comparison, the official `opencv-python-headless` 4.14.0.94 wheel with NumPy is about 72 MB zipped and 215 MB unzipped. Each release lists the size of every asset.
 
 > [!TIP]
 > `arm64` (Graviton) is about 20% cheaper per GB-second than `x86_64`.
@@ -94,7 +102,7 @@ The layers keep only what image processing on Lambda needs.
 | TIFF, JPEG 2000, OpenEXR, AVIF, HDR, PNM codecs | Only JPEG, PNG, and WebP can be read and written |
 | OpenBLAS (OpenCV and NumPy) | NumPy uses its bundled `lapack_lite`. Large `matmul` and `linalg` calls are slower |
 | IPP, OpenCL, TBB, Eigen | OpenCV uses its own SIMD kernels and pthreads |
-| Haar cascade XML files | Ship the XML files you need with your function |
+| Haar cascade XML files | Ship the XML files you need with your function. `cv2.CascadeClassifier` is only available with 4.14.0, because OpenCV 5 removed it from the main repository |
 | `python3.11` and older | These runtimes run on Amazon Linux 2 and are not supported |
 
 
