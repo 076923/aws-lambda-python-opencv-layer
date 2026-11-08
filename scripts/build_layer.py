@@ -29,7 +29,6 @@ import zipfile
 from pathlib import Path
 
 DEFAULT_NUMPY = "2.5.4"
-LIMITED_API = "0x030C0000"  # Python 3.12
 
 # OpenCV 5 renamed several modules. Names that do not exist in the source
 # tree are dropped before configuring, so one list covers 4.x and 5.x.
@@ -60,8 +59,10 @@ CMAKE_COMMON = {
     "OPENCV_GENERATE_PKGCONFIG": "OFF",
     "INSTALL_PYTHON_EXAMPLES": "OFF",
     "INSTALL_C_EXAMPLES": "OFF",
+    # Default Limited API version (3.6), same as the official abi3 wheels.
+    # Raising it to 3.12 breaks OpenCV's bindings: Py_INCREF and
+    # PyType_CheckExact become uncasted functions under that API level.
     "PYTHON3_LIMITED_API": "ON",
-    "PYTHON3_LIMITED_API_VERSION": LIMITED_API,
     # Image codecs: JPEG, PNG, WebP only, built from bundled sources.
     "WITH_JPEG": "ON", "BUILD_JPEG": "ON",
     "WITH_PNG": "ON", "BUILD_PNG": "ON", "BUILD_ZLIB": "ON",
