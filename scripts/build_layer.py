@@ -178,7 +178,10 @@ def pip(*args) -> None:
 
 
 def install_toolchain() -> None:
-    run("dnf", "install", "-y", "gcc", "gcc-c++", "binutils")
+    # libjpeg-turbo needs NASM for its x86_64 SIMD code; without it JPEG
+    # encode/decode silently falls back to plain C. arm64 uses NEON intrinsics.
+    extra = ["nasm"] if arch() == "x86_64" else []
+    run("dnf", "install", "-y", "gcc", "gcc-c++", "binutils", *extra)
     pip("install", *[f"{k}=={v}" for k, v in BUILD_TOOLS.items()])
 
 
@@ -304,6 +307,9 @@ def build_opencv(version: str, profile: str, out: Path) -> Path:
     print("+", " ".join(configure), flush=True)
     result = subprocess.run(configure, check=True, capture_output=True, text=True)
     print(result.stdout, result.stderr, sep="\n", flush=True)
+    jpeg_simd = re.search(r"JPEG:.*\n.*SIMD Support Request:.*\n--\s+SIMD Support:\s+(\S+)", result.stdout)
+    if not jpeg_simd or jpeg_simd.group(1) != "YES":
+        sys.exit("libjpeg-turbo SIMD is disabled; check the cmake output above")
     run("cmake", "--build", build)
     run("cmake", "--install", build, "--strip")
 
